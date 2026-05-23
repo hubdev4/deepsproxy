@@ -53,11 +53,59 @@ test('multiturn-thinking-tools: serializes complete OpenAI message history', asy
     // Validate that the complete OpenAI history is sent to DeepSeek. Agents
     // need the original user request, assistant tool call, and tool result to
     // produce the post-tool final answer.
-    assert.ok(capturedPrompt.includes('User: hello'), 'Must include original user message');
-    assert.ok(capturedPrompt.includes('Assistant:'), 'Must include assistant history');
+    assert.ok(capturedPrompt.includes('<message role="user">\nhello\n</message>'), 'Must include original user message');
+    assert.ok(capturedPrompt.includes('<message role="assistant">'), 'Must include assistant history');
     assert.ok(capturedPrompt.includes('<think>\nthinking about hello\n</think>'), 'Must include previous thinking');
     assert.ok(capturedPrompt.includes('<tool_call>{"name": "test", "arguments": {}}</tool_call>'), 'Must include previous tool call');
-    assert.ok(capturedPrompt.includes('Tool Response (test): success'), 'Must include tool response signature');
+    assert.ok(capturedPrompt.includes('<message role="tool" name="test">\nsuccess\n</message>'), 'Must include tool response as role-delimited history');
+    assert.ok(!capturedPrompt.includes('Tool Response (test):'), 'Prompt should avoid transcript labels that models copy');
+  } finally {
+    restore();
+  }
+});
+
+test('post-tool truncation preserves latest user intent and clips oversized tool result', async () => {
+  let capturedPrompt = '';
+  const hugeToolOutput = `SKILL_VIEW_START\n${'A'.repeat(150_000)}\nSKILL_VIEW_END`;
+
+  const restore = setupFetchMock((url, init) => {
+    const bodyObj = JSON.parse(init?.body as string || '{}');
+    capturedPrompt = bodyObj.prompt;
+    const stream = new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":"continuando"}\n\n'));
+        c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+        c.close();
+      }
+    });
+    return new Response(stream, { status: 200 });
+  });
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-flash',
+        messages: [
+          { role: 'system', content: 'Você é Hermes.' },
+          { role: 'user', content: 'Pesquise novidades do Hermes usando Chrome via ADB no Samsung A55.' },
+          { role: 'assistant', content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'skill_view', arguments: '{"name":"hermes-agent"}' } }] },
+          { role: 'tool', tool_call_id: 'call_1', name: 'skill_view', content: hugeToolOutput }
+        ],
+        stream: false
+      })
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+    await res.json();
+
+    assert.ok(capturedPrompt.includes('<message role="user">\nPesquise novidades do Hermes usando Chrome via ADB no Samsung A55.\n</message>'), 'latest user objective must survive truncation');
+    assert.ok(capturedPrompt.includes('<message role="tool" name="skill_view">\nSKILL_VIEW_START'), 'oversized tool result should be clipped, not dropped entirely');
+    assert.ok(capturedPrompt.includes('tool response truncated by deepsproxy'), 'clipped tool result should be marked explicitly');
+    assert.ok(capturedPrompt.includes('SKILL_VIEW_END'), 'tail of clipped tool result should be preserved');
+    assert.ok(capturedPrompt.length < 130_000, 'prompt should stay below the conservative browser-backed budget');
   } finally {
     restore();
   }
@@ -226,7 +274,7 @@ test('openai-requests-are-stateless: each request starts a fresh DeepSeek turn',
     assert.strictEqual(capturedPayloads[1].parent_message_id, null, 'Turn 2 should start a fresh DeepSeek turn');
     assert.strictEqual(
       capturedPayloads[1].prompt,
-      'User: Turn 1\n\nAssistant: Response 1\n\nUser: Turn 2\n\n',
+      '<message role="user">\nTurn 1\n</message>\n\n<message role="assistant">\nResponse 1\n</message>\n\n<message role="user">\nTurn 2\n</message>\n\n',
       'Should send complete message history'
     );
   } finally {
@@ -420,6 +468,119 @@ test('malformed internal tool call with lead-in returns safe content instead of 
     assert.ok(!text.includes('"tool_calls"'), 'unparseable tool call must not be exposed as a fake structured tool call');
     assert.ok(text.includes('Não encontrei o dispositivo'), 'lead-in content must be preserved as a non-empty fallback');
     assert.ok(text.includes('"finish_reason":"stop"'));
+  } finally {
+    restore();
+  }
+});
+
+test('streaming tool turn suppresses prose and transcript echo that arrives before tool_call', async () => {
+  const restore = setupFetchMock((url) => {
+    const stream = new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":"That parsing approach is fragile.\\nTool Response (terminal): {\\\"output\\\":\\\"\\\"}\\nAssistant: <think>\\n"}\n\n'));
+        c.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":"<tool_call name=\\"terminal\\"><parameter name=\\"command\\">adb devices</parameter></tool_call>"}\n\n'));
+        c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+        c.close();
+      }
+    });
+    return new Response(stream, { status: 200 });
+  });
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-pro',
+        messages: [{ role: 'user', content: 'debug adb' }],
+        stream: true,
+        tools: [{ type: 'function', function: { name: 'terminal', parameters: { type: 'object', properties: { command: { type: 'string' } } } } }]
+      })
+    });
+
+    const res = await app.fetch(req);
+    const text = await res.text();
+    assert.ok(!text.includes('Tool Response (terminal)'), 'transcript echo must not leak into SSE content before a tool call');
+    assert.ok(!text.includes('Assistant: <think>'), 'assistant transcript label must not leak into SSE content before a tool call');
+    assert.ok(!text.includes('That parsing approach is fragile'), 'pre-tool explanatory prose should be suppressed for structured tool-call turns');
+    assert.ok(text.includes('"tool_calls"'), 'SSE must expose the tool call structurally');
+    assert.ok(text.includes('adb devices'), 'structured tool call should preserve arguments');
+    assert.ok(text.includes('"finish_reason":"tool_calls"'));
+  } finally {
+    restore();
+  }
+});
+
+test('JSON tool calls using tool-name shorthand are converted to structured OpenAI tool_calls', async () => {
+  const restore = setupFetchMock((url) => {
+    const stream = new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":"Vou abrir o Chrome no dispositivo.\\n<tool_call>{\\"terminal\\":{\\"command\\":\\"adb -s 192.168.2.52:5555 shell uiautomator dump /sdcard/screen.xml\\",\\"timeout\\":30}}</tool_call>"}\n\n'));
+        c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+        c.close();
+      }
+    });
+    return new Response(stream, { status: 200 });
+  });
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-pro',
+        messages: [{ role: 'user', content: 'use adb para consultar a tela' }],
+        stream: false,
+        tools: [{ type: 'function', function: { name: 'terminal', parameters: { type: 'object', properties: { command: { type: 'string' }, timeout: { type: 'number' } } } } }]
+      })
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+    const body = await res.json();
+    assert.strictEqual(body.choices[0].message.content, null);
+    assert.strictEqual(body.choices[0].finish_reason, 'tool_calls');
+    assert.strictEqual(body.choices[0].message.tool_calls[0].function.name, 'terminal');
+    const args = JSON.parse(body.choices[0].message.tool_calls[0].function.arguments);
+    assert.strictEqual(args.command, 'adb -s 192.168.2.52:5555 shell uiautomator dump /sdcard/screen.xml');
+    assert.strictEqual(args.timeout, 30);
+  } finally {
+    restore();
+  }
+});
+
+test('excessive consecutive tool calls are capped to one per assistant turn by default', async () => {
+  const restore = setupFetchMock((url) => {
+    const stream = new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":"<tool_call name=\\"terminal\\"><parameter name=\\"command\\">adb devices</parameter></tool_call><tool_call name=\\"terminal\\"><parameter name=\\"command\\">adb shell ss -ltnp</parameter></tool_call><tool_call name=\\"terminal\\"><parameter name=\\"command\\">curl localhost:9222/json/version</parameter></tool_call>"}\n\n'));
+        c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+        c.close();
+      }
+    });
+    return new Response(stream, { status: 200 });
+  });
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-pro',
+        messages: [{ role: 'user', content: 'debug chrome adb' }],
+        stream: false,
+        tools: [{ type: 'function', function: { name: 'terminal', parameters: { type: 'object', properties: { command: { type: 'string' } } } } }]
+      })
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+    const body = await res.json();
+    assert.strictEqual(body.choices[0].message.content, null);
+    assert.strictEqual(body.choices[0].finish_reason, 'tool_calls');
+    assert.strictEqual(body.choices[0].message.tool_calls.length, 1, 'only one tool call should be forwarded by default');
+    const args = JSON.parse(body.choices[0].message.tool_calls[0].function.arguments);
+    assert.strictEqual(args.command, 'adb devices');
   } finally {
     restore();
   }

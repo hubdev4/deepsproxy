@@ -14,12 +14,13 @@ import { cors } from 'hono/cors';
 import { chatCompletions } from './routes/chat.ts';
 import * as dotenv from 'dotenv';
 import { initPlaywright } from './services/playwright.ts';
+import { getTraceLogPath, isDevLogEnabled, trace } from './utils/trace.ts';
 
 dotenv.config();
 
 export const app = new Hono();
 
-const MODEL_CONTEXT_LENGTH = 64_000;
+const MODEL_CONTEXT_LENGTH = 48_000;
 
 function modelEntry(id: string) {
   return {
@@ -78,6 +79,8 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     console.log('Playwright initialized.');
     const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
     console.log(`Server is running on port ${port}`);
+    console.log(`DeepsProxy dev log: ${getTraceLogPath()} (${isDevLogEnabled() ? 'enabled' : 'disabled; set DEEPSPROXY_DEV_LOG=true to enable'})`);
+    trace('startup', 'server_start', { port, debugLogPath: getTraceLogPath() });
 
     serve({
       fetch: app.fetch,

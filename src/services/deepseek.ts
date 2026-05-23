@@ -9,6 +9,7 @@
  */
 
 import { getDeepSeekHeaders } from './playwright.ts';
+import { shortHash, snippet, trace, TraceContext } from '../utils/trace.ts';
 
 // In-memory state to track the last message ID per session to avoid overwriting
 // Use globalThis to ensure it survives module reloads in some test environments
@@ -36,11 +37,22 @@ export async function createDeepSeekStream(
   prompt: string,
   enableThinking: boolean,
   isProModel: boolean = false,
-  forcedParentId?: number | null
+  forcedParentId?: number | null,
+  ctx?: TraceContext
 ): Promise<{ stream: ReadableStream, headers: Record<string, string>, uiSessionId: string }> {
   // Obtain fresh headers/PoW from Playwright
   // If forcedParentId is null, it means we are explicitly starting a new session
-  const { headers, chatSessionId, parentMessageId } = await getDeepSeekHeaders(forcedParentId === null);
+  trace(ctx, 'deepseek_headers_start', { forceNew: forcedParentId === null, promptLength: prompt.length, promptHash: shortHash(prompt), promptSnippet: snippet(prompt, 300) });
+  const { headers, chatSessionId, parentMessageId } = await getDeepSeekHeaders(forcedParentId === null, ctx);
+  trace(ctx, 'deepseek_headers_ready', {
+    chatSessionIdHash: shortHash(chatSessionId),
+    parentMessageId,
+    hasAuthorization: Boolean(headers['authorization']),
+    hasCookie: Boolean(headers['cookie']),
+    hasPow: Boolean(headers['x-ds-pow-response']),
+    hasHifDliq: Boolean(headers['x-hif-dliq']),
+    hasHifLeim: Boolean(headers['x-hif-leim'])
+  });
 
   // Determine the actual parent ID:
   // 1. If forcedParentId is provided (even if null), use it.
@@ -65,6 +77,18 @@ export async function createDeepSeekStream(
     preempt: false
   };
 
+  trace(ctx, 'deepseek_fetch_start', {
+    url: 'https://chat.deepseek.com/api/v0/chat/completion',
+    chatSessionIdHash: shortHash(chatSessionId),
+    parentMessageId: actualParentId,
+    modelType: payload.model_type,
+    thinkingEnabled: payload.thinking_enabled,
+    searchEnabled: payload.search_enabled,
+    payloadPromptLength: payload.prompt.length,
+    payloadHash: shortHash(payload)
+  });
+  const fetchStart = Date.now();
+
   const response = await fetch('https://chat.deepseek.com/api/v0/chat/completion', {
     method: 'POST',
     headers: {
@@ -86,8 +110,18 @@ export async function createDeepSeekStream(
 
   if (!response.ok || !response.body) {
     const errText = await response.text().catch(() => '');
+    trace(ctx, 'deepseek_fetch_error', { elapsedMs: Date.now() - fetchStart, status: response.status, statusText: response.statusText, bodySnippet: snippet(errText, 1000) });
     throw new Error(`Failed to fetch from DeepSeek: ${response.status} ${response.statusText} - ${errText}`);
   }
+
+  trace(ctx, 'deepseek_fetch_response_ok', {
+    elapsedMs: Date.now() - fetchStart,
+    status: response.status,
+    statusText: response.statusText,
+    contentType: response.headers.get('content-type'),
+    transferEncoding: response.headers.get('transfer-encoding'),
+    hasBody: Boolean(response.body)
+  });
 
   return { stream: response.body, headers, uiSessionId: chatSessionId };
 }
