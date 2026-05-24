@@ -149,6 +149,42 @@ test('non-stream chat completions: returns a JSON completion object instead of S
   }
 });
 
+test('streaming plain Calling tool marker: converts to structured tool_calls', async () => {
+  const restore = setupFetchMock((url) => {
+    const stream = new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('data: {"v":{"response":{"message_id":1}}}\n\n'));
+        c.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":"Vou analisar a segurança do site.\\nCalling: todo\\n\\n{\\\"todos\\\":[{\\\"id\\\":\\\"1\\\",\\\"content\\\":\\\"Verificar headers\\\",\\\"status\\\":\\\"in_progress\\\"}]}"}\n\n'));
+        c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+        c.close();
+      }
+    });
+    return new Response(stream, { status: 200 });
+  });
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-flash',
+        messages: [{role: 'user', content: 'analise a segurança do site'}],
+        stream: true,
+        tools: [{ type: 'function', function: { name: 'todo', parameters: { type: 'object', properties: { todos: { type: 'array' } } } } }]
+      })
+    });
+
+    const res = await app.fetch(req);
+    const text = await res.text();
+    assert.ok(!text.includes('Calling: todo'), 'plain tool marker must not leak as content');
+    assert.ok(text.includes('"tool_calls"'), 'response must contain structured tool_calls');
+    assert.ok(text.includes('"name":"todo"'), 'tool call must target todo');
+    assert.ok(text.includes('"finish_reason":"tool_calls"'));
+  } finally {
+    restore();
+  }
+});
+
 test('caching-streaming and cache-control: returns prompt_tokens_details', async () => {
   const restore = setupFetchMock((url) => {
     const stream = new ReadableStream({

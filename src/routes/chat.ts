@@ -17,12 +17,56 @@ import { robustParseJSON } from '../utils/json.ts';
 import { registry } from '../tools/registry.ts';
 import type { FunctionToolDefinition } from '../tools/types.ts';
 
+type ParsedPlainCallingTool = {
+  leadIn: string;
+  name: string;
+  arguments: Record<string, unknown>;
+};
+
+function getAllowedToolNames(tools: any): Set<string> {
+  if (!Array.isArray(tools)) return new Set();
+  return new Set(tools
+    .map((tool: any) => tool?.type === 'function' ? tool?.function?.name : tool?.name)
+    .filter((name: any) => typeof name === 'string' && name.length > 0));
+}
+
+function parsePlainCallingTool(text: string, allowedToolNames: Set<string>): ParsedPlainCallingTool | null {
+  const match = text.match(/(^|\n)Calling:\s*([A-Za-z0-9_-]+)\s*\n\n([\s\S]+)$/);
+  if (!match) return null;
+
+  const name = match[2];
+  if (allowedToolNames.size > 0 && !allowedToolNames.has(name)) return null;
+
+  const parsedArgs = robustParseJSON(match[3].trim());
+  if (!parsedArgs || typeof parsedArgs !== 'object' || Array.isArray(parsedArgs)) return null;
+
+  const markerIndex = match.index! + match[1].length;
+  return {
+    leadIn: text.substring(0, markerIndex),
+    name,
+    arguments: parsedArgs as Record<string, unknown>
+  };
+}
+
+function makeToolCallDelta(toolName: string, toolArgs: Record<string, unknown>, index?: number) {
+  return {
+    index,
+    id: 'call_' + uuidv4(),
+    type: 'function',
+    function: {
+      name: toolName,
+      arguments: JSON.stringify(toolArgs)
+    }
+  };
+}
+
 async function collectNonStreamingCompletion(
   stream: ReadableStream,
   uiSessionId: string,
   completionId: string,
   model: string,
-  promptTokens: number
+  promptTokens: number,
+  allowedToolNames: Set<string>
 ) {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
@@ -126,6 +170,12 @@ async function collectNonStreamingCompletion(
   }
 
   const toolCalls: any[] = [];
+  const plainCallingTool = parsePlainCallingTool(content, allowedToolNames);
+  if (plainCallingTool) {
+    content = plainCallingTool.leadIn;
+    toolCalls.push(makeToolCallDelta(plainCallingTool.name, plainCallingTool.arguments));
+  }
+
   const toolCallRegex = /<tool_call>([\s\S]*?)<\/tool_call>/g;
   let match: RegExpExecArray | null;
   while ((match = toolCallRegex.exec(content)) !== null) {
@@ -238,6 +288,7 @@ export async function chatCompletions(c: Context) {
 
     // Inject tools instructions
     const bodyAny = body as any;
+    const allowedToolNames = getAllowedToolNames(bodyAny.tools);
     if (bodyAny.tools && Array.isArray(bodyAny.tools) && bodyAny.tools.length > 0) {
       // Better formatting for tools
       const formattedTools = bodyAny.tools.map((t: any) => {
@@ -292,7 +343,7 @@ export async function chatCompletions(c: Context) {
     const promptTokens = Math.ceil(finalPrompt.length / 3.5);
 
     if (!isStream) {
-      const completion = await collectNonStreamingCompletion(stream!, uiSessionId, completionId, body.model, promptTokens);
+      const completion = await collectNonStreamingCompletion(stream!, uiSessionId, completionId, body.model, promptTokens, allowedToolNames);
       return c.json(completion);
     }
 
@@ -453,6 +504,32 @@ export async function chatCompletions(c: Context) {
 
                 while (contentEmitBuffer.length > 0) {
                   if (!insideTool) {
+                    const plainCallingTool = parsePlainCallingTool(contentEmitBuffer, allowedToolNames);
+                    if (plainCallingTool) {
+                      if (plainCallingTool.leadIn && emittedToolCallCount === 0) {
+                        await writeEvent({
+                          id: completionId,
+                          object: 'chat.completion.chunk',
+                          created: Math.floor(Date.now() / 1000),
+                          model: body.model,
+                          choices: [makeChoice({ content: plainCallingTool.leadIn })]
+                        });
+                      }
+
+                      await writeEvent({
+                        id: completionId,
+                        object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000),
+                        model: body.model,
+                        choices: [makeChoice({
+                          tool_calls: [makeToolCallDelta(plainCallingTool.name, plainCallingTool.arguments, emittedToolCallCount)]
+                        })]
+                      });
+                      emittedToolCallCount++;
+                      contentEmitBuffer = '';
+                      break;
+                    }
+
                     const startIdx = contentEmitBuffer.indexOf(TOOL_START);
                     if (startIdx !== -1) {
                       // Found tool start. Emit everything before it as text
