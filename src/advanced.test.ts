@@ -109,6 +109,46 @@ test('streaming-whitespace: preserves exact whitespace', async () => {
   }
 });
 
+test('non-stream chat completions: returns a JSON completion object instead of SSE', async () => {
+  const restore = setupFetchMock((url) => {
+    const stream = new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('data: {"v":{"response":{"message_id":1}}}\n\n'));
+        c.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":"Hello"}\n\n'));
+        c.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":" world"}\n\n'));
+        c.enqueue(new TextEncoder().encode('data: {"p":"response/accumulated_token_usage","o":"SET","v":2}\n\n'));
+        c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+        c.close();
+      }
+    });
+    return new Response(stream, { status: 200 });
+  });
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek-v4-flash', messages: [{role: 'user', content: 'title'}], stream: false })
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+    assert.ok(res.headers.get('Content-Type')?.includes('application/json'));
+
+    const text = await res.text();
+    assert.ok(!text.startsWith('data:'), 'non-stream response must not be SSE-framed');
+
+    const body = JSON.parse(text);
+    assert.strictEqual(body.object, 'chat.completion');
+    assert.strictEqual(body.choices[0].message.role, 'assistant');
+    assert.strictEqual(body.choices[0].message.content, 'Hello world');
+    assert.strictEqual(body.choices[0].finish_reason, 'stop');
+    assert.strictEqual(body.usage.completion_tokens, 2);
+  } finally {
+    restore();
+  }
+});
+
 test('caching-streaming and cache-control: returns prompt_tokens_details', async () => {
   const restore = setupFetchMock((url) => {
     const stream = new ReadableStream({

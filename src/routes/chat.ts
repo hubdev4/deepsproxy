@@ -17,6 +17,180 @@ import { robustParseJSON } from '../utils/json.ts';
 import { registry } from '../tools/registry.ts';
 import type { FunctionToolDefinition } from '../tools/types.ts';
 
+async function collectNonStreamingCompletion(
+  stream: ReadableStream,
+  uiSessionId: string,
+  completionId: string,
+  model: string,
+  promptTokens: number
+) {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+
+  let currentAppendPath = '';
+  let currentFragmentType = '';
+  let reasoningContent = '';
+  let content = '';
+  let completionTokens = 0;
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.startsWith('data: ')) continue;
+
+      const dataStr = trimmed.slice(6);
+      if (dataStr === '[DONE]') continue;
+
+      try {
+        const chunk = JSON.parse(dataStr);
+        let dsMessageId: any = null;
+        if (chunk.response_message_id) {
+          dsMessageId = chunk.response_message_id;
+        } else if (chunk.v && typeof chunk.v === 'object') {
+          if (chunk.v.response && chunk.v.response.message_id) {
+            dsMessageId = chunk.v.response.message_id;
+          } else if (chunk.v.message_id) {
+            dsMessageId = chunk.v.message_id;
+          }
+        } else if (chunk.message_id) {
+          dsMessageId = chunk.message_id;
+        }
+
+        if (dsMessageId) {
+          updateSessionParent(uiSessionId, dsMessageId);
+        }
+
+        let vStr = '';
+        let foundStr = false;
+
+        if (typeof chunk.p === 'string') {
+          currentAppendPath = chunk.p;
+          if (chunk.p === 'response/accumulated_token_usage' && typeof chunk.v === 'number') {
+            completionTokens = chunk.v;
+          }
+        }
+
+        if (typeof chunk.v === 'string') {
+          vStr = chunk.v;
+          foundStr = true;
+        } else if (chunk.v && typeof chunk.v === 'object') {
+          if (chunk.v.response && chunk.v.response.fragments && chunk.v.response.fragments.length > 0) {
+            const frag = chunk.v.response.fragments[0];
+            if (typeof frag.content === 'string') {
+              vStr = frag.content;
+              foundStr = true;
+              currentAppendPath = frag.type === 'THINK' ? 'response/thinking_content' : 'response/content';
+              currentFragmentType = frag.type || '';
+            }
+          } else if (Array.isArray(chunk.v) && chunk.v.length > 0) {
+            const firstObj = chunk.v[0];
+            if (typeof firstObj.content === 'string') {
+              vStr = firstObj.content;
+              foundStr = true;
+              currentAppendPath = firstObj.type === 'THINK' ? 'response/thinking_content' : 'response/content';
+              currentFragmentType = firstObj.type || '';
+            }
+          }
+        }
+
+        if (chunk.p === 'response/fragments' && Array.isArray(chunk.v)) {
+          const lastFrag = chunk.v[chunk.v.length - 1];
+          if (lastFrag && lastFrag.type) {
+            currentFragmentType = lastFrag.type;
+          }
+        }
+
+        const isThinkingChunk = currentAppendPath.includes('thinking_content') ||
+          currentAppendPath.includes('THINK') ||
+          (currentAppendPath.includes('fragments/-1/content') && currentFragmentType === 'THINK');
+
+        if (foundStr && vStr !== '' && vStr !== 'FINISHED') {
+          if (isThinkingChunk) {
+            reasoningContent += vStr;
+          } else {
+            content += vStr;
+          }
+        }
+      } catch (e) {
+        // Ignore malformed upstream SSE lines and continue collecting.
+      }
+    }
+  }
+
+  const toolCalls: any[] = [];
+  const toolCallRegex = /<tool_call>([\s\S]*?)<\/tool_call>/g;
+  let match: RegExpExecArray | null;
+  while ((match = toolCallRegex.exec(content)) !== null) {
+    const toolJsonStr = match[1].trim();
+    const toolCallObj = robustParseJSON(toolJsonStr);
+    if (!toolCallObj) continue;
+
+    const nameMatch = toolJsonStr.match(/<tool_call\s+name="([^"]+)"/);
+    const toolName = nameMatch ? nameMatch[1] : toolCallObj.name || '';
+    let toolArgs: Record<string, unknown> = {};
+    if (toolCallObj.arguments && typeof toolCallObj.arguments === 'object') {
+      toolArgs = toolCallObj.arguments;
+    } else {
+      for (const key of Object.keys(toolCallObj).filter(k => k !== 'name')) {
+        toolArgs[key] = toolCallObj[key];
+      }
+    }
+
+    toolCalls.push({
+      id: 'call_' + uuidv4(),
+      type: 'function',
+      function: {
+        name: toolName,
+        arguments: JSON.stringify(toolArgs)
+      }
+    });
+  }
+
+  const strippedContent = content.replace(toolCallRegex, '').trim();
+  const hasToolCalls = toolCalls.length > 0;
+  const usage = {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: promptTokens + completionTokens,
+    prompt_tokens_details: {
+      cached_tokens: 0
+    }
+  };
+
+  const message: any = {
+    role: 'assistant',
+    content: hasToolCalls ? (strippedContent || null) : content
+  };
+  if (reasoningContent) {
+    message.reasoning_content = reasoningContent;
+  }
+  if (hasToolCalls) {
+    message.tool_calls = toolCalls;
+  }
+
+  return {
+    id: completionId,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{
+      index: 0,
+      message,
+      logprobs: null,
+      finish_reason: hasToolCalls ? 'tool_calls' : 'stop'
+    }],
+    usage
+  };
+}
+
 export async function chatCompletions(c: Context) {
   try {
     const body: OpenAIRequest = await c.req.json();
@@ -114,11 +288,17 @@ export async function chatCompletions(c: Context) {
       }
     }
 
+    const completionId = 'chatcmpl-' + uuidv4();
+    const promptTokens = Math.ceil(finalPrompt.length / 3.5);
+
+    if (!isStream) {
+      const completion = await collectNonStreamingCompletion(stream!, uiSessionId, completionId, body.model, promptTokens);
+      return c.json(completion);
+    }
+
     c.header('Content-Type', 'text/event-stream');
     c.header('Cache-Control', 'no-cache');
     c.header('Connection', 'keep-alive');
-
-    const completionId = 'chatcmpl-' + uuidv4();
 
     return honoStream(c, async (streamWriter: any) => {
       const writeEvent = async (data: any) => {
@@ -159,7 +339,6 @@ export async function chatCompletions(c: Context) {
 
       let buffer = '';
       let completionTokens = 0;
-      const promptTokens = Math.ceil(finalPrompt.length / 3.5);
 
       while (true) {
         const { done, value } = await reader.read();
