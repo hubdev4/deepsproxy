@@ -60,6 +60,25 @@ function makeToolCallDelta(toolName: string, toolArgs: Record<string, unknown>, 
   };
 }
 
+function stringifyMessageContent(content: any): string {
+  if (Array.isArray(content)) {
+    return content.map((part: any) => {
+      if (typeof part === 'string') return part;
+      if (part && typeof part === 'object' && typeof part.text === 'string') return part.text;
+      return JSON.stringify(part);
+    }).join('\n');
+  }
+
+  if (content && typeof content === 'object') return JSON.stringify(content);
+  return content || '';
+}
+
+function serializeToolCall(tc: any): string {
+  let args = tc.function?.arguments || '{}';
+  if (typeof args !== 'string') args = JSON.stringify(args);
+  return `<tool_call>{"name": "${tc.function?.name}", "arguments": ${args}}</tool_call>`;
+}
+
 async function collectNonStreamingCompletion(
   stream: ReadableStream,
   uiSessionId: string,
@@ -246,43 +265,41 @@ export async function chatCompletions(c: Context) {
     const body: OpenAIRequest = await c.req.json();
     const isStream = body.stream ?? false;
     
-    // Extract the prompt
+    // Extract the full OpenAI conversation, not just the final message.
+    // Tool continuations arrive as: user -> assistant.tool_calls -> tool.
+    // If only the final tool message is forwarded, DeepSeek receives an orphaned
+    // tool result and often returns an empty continuation.
     let prompt = '';
     const messages = body.messages || [];
     let systemPrompt = '';
+    const toolCallNamesById = new Map<string, string>();
     
-    for (let i = 0; i < messages.length; i++) {
-      const msg = messages[i];
-      let contentStr = '';
-      if (Array.isArray(msg.content)) {
-        contentStr = msg.content.map((c: any) => c.text || JSON.stringify(c)).join('\n');
-      } else if (typeof msg.content === 'object' && msg.content !== null) {
-        contentStr = JSON.stringify(msg.content);
-      } else {
-        contentStr = msg.content || '';
-      }
+    for (const msg of messages) {
+      const contentStr = stringifyMessageContent((msg as any).content);
 
       if (msg.role === 'system') {
         systemPrompt += contentStr + '\n\n';
-      } else if (i === messages.length - 1) {
-        if (msg.role === 'user') {
-          prompt += `User: ${contentStr}\n\n`;
-        } else if (msg.role === 'assistant') {
-          let assistantContent = contentStr;
-          if ((msg as any).reasoning_content) {
-            assistantContent = `<think>\n${(msg as any).reasoning_content}\n</think>\n${assistantContent}`;
-          }
-          if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
-             for (const tc of msg.tool_calls) {
-               let args = tc.function?.arguments || '{}';
-               if (typeof args !== 'string') args = JSON.stringify(args);
-               assistantContent += `\n<tool_call>{"name": "${tc.function?.name}", "arguments": ${args}}</tool_call>`;
-             }
-          }
-          prompt += `Assistant: ${assistantContent.trim()}\n\n`;
-        } else if (msg.role === 'tool' || msg.role === 'function') {
-          prompt += `Tool Response (${msg.name || 'tool'}): ${contentStr}\n\n`;
+      } else if (msg.role === 'user') {
+        prompt += `User: ${contentStr}\n\n`;
+      } else if (msg.role === 'assistant') {
+        let assistantContent = contentStr;
+        if ((msg as any).reasoning_content) {
+          assistantContent = `<think>\n${(msg as any).reasoning_content}\n</think>\n${assistantContent}`;
         }
+        if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
+          for (const tc of msg.tool_calls) {
+            if (tc?.id && tc?.function?.name) {
+              toolCallNamesById.set(tc.id, tc.function.name);
+            }
+            assistantContent += `\n${serializeToolCall(tc)}`;
+          }
+        }
+        prompt += `Assistant: ${assistantContent.trim()}\n\n`;
+      } else if (msg.role === 'tool' || msg.role === 'function') {
+        const toolCallId = (msg as any).tool_call_id;
+        const toolName = msg.name || (toolCallId ? toolCallNamesById.get(toolCallId) : undefined) || 'tool';
+        const toolLabel = toolCallId ? `${toolName}, id=${toolCallId}` : toolName;
+        prompt += `Tool Response (${toolLabel}): ${contentStr}\n\n`;
       }
     }
 
